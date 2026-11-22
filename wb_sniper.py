@@ -1,18 +1,20 @@
 import asyncio
 import logging
 import os
+import random
 import sqlite3
 import statistics
+import time
 from datetime import datetime
-import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
+from curl_cffi.requests import AsyncSession
 
 # --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-PROXY_URL = os.getenv("PROXY_URL")  # Формат: http://login:pass@ip:port
+PROXY_URL = os.getenv("PROXY_URL")
 CHAT_ID = 829573437
 
 DEFAULT_QUERIES = [
@@ -23,8 +25,8 @@ DEFAULT_QUERIES = [
     "куртка мужская зимняя"
 ]
 
-MIN_HISTORY_POINTS = 5       # Минимум замеров для расчета честной медианы
-DISCOUNT_MULTIPLIER = 5.0    # Дешевле медианы в 5+ раз (скидка >= 80%)
+MIN_HISTORY_POINTS = 5
+DISCOUNT_MULTIPLIER = 5.0
 MIN_RATING = 4.5
 MIN_FEEDBACKS = 10
 CHECK_INTERVAL_SEC = 180
@@ -33,7 +35,7 @@ DB_PATH = "wb_prices.db"
 logging.basicConfig(level=logging.INFO)
 
 if not BOT_TOKEN:
-    raise ValueError("Ошибка: не задана переменная окружения BOT_TOKEN в настройках Render!")
+    raise ValueError("Ошибка: не задана переменная окружения BOT_TOKEN!")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -94,13 +96,14 @@ def save_and_check_price(nm_id: int, current_price: float) -> tuple[bool, float,
     conn.close()
     return False, median_price, ratio
 
-# --- ПАРСИНГ WILDBERRIES ЧЕРЕЗ РФ-ПРОКСИ ---
-async def fetch_wb_search(session: aiohttp.ClientSession, query: str, page: int = 1) -> list[dict]:
+# --- ПАРСИНГ WILDBERRIES ЧЕРЕЗ CHROME TLS + РФ-ПРОКСИ ---
+async def fetch_wb_search(session: AsyncSession, query: str, page: int = 1) -> list[dict]:
     endpoints = [
         "https://search.wb.ru/exactmatch/ru/common/v13/search",
         "https://search.wb.ru/exactmatch/ru/common/v9/search",
         "https://u-search.wb.ru/exactmatch/ru/common/v13/search"
     ]
+    qid = f"qid{random.randint(100000000, 999999999)}{int(time.time())}"
     params = {
         "ab_testing": "false",
         "appType": "1",
@@ -118,34 +121,28 @@ async def fetch_wb_search(session: aiohttp.ClientSession, query: str, page: int 
     headers = {
         "Accept": "*/*",
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Connection": "keep-alive",
         "Origin": "https://www.wildberries.ru",
-        "Referer": f"https://www.wildberries.ru/catalog/0/search.aspx?search={query}",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "cross-site",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"'
+        "Referer": "https://www.wildberries.ru/",
+        "x-queryid": qid
     }
+    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
     for url in endpoints:
         try:
-            async with session.get(
+            resp = await session.get(
                 url,
                 params=params,
                 headers=headers,
-                proxy=PROXY_URL,
+                proxies=proxies,
                 timeout=20
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    products = data.get("data", {}).get("products", [])
-                    if products:
-                        return products
-                else:
-                    logging.warning(f"Эндпоинт {url} вернул статус {resp.status}")
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                products = data.get("data", {}).get("products", [])
+                if products:
+                    return products
+            else:
+                logging.warning(f"Эндпоинт {url} вернул статус {resp.status_code} | Ответ: {resp.text[:120]}")
         except Exception as e:
             logging.warning(f"Сбой на {url} для '{query}': {e}")
             continue
@@ -154,11 +151,18 @@ async def fetch_wb_search(session: aiohttp.ClientSession, query: str, page: int 
     return []
 
 async def scanner_loop():
-    connector = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+    async with AsyncSession(impersonate="chrome131") as session:
+        # Прогрев сессии: получаем куки с главной страницы WB
+        try:
+            await session.get("https://www.wildberries.ru/", proxies=proxies, timeout=20)
+            logging.info("Сессия WB успешно прогрета (куки получены).")
+        except Exception as e:
+            logging.warning(f"Не удалось прогреть главную WB: {e}")
+
         while True:
             queries = get_queries()
-            proxy_status = "через РФ-прокси" if PROXY_URL else "БЕЗ ПРОКСИ (напрямую)"
+            proxy_status = "через РФ-прокси (Chrome TLS)" if PROXY_URL else "БЕЗ ПРОКСИ"
             logging.info(f"Сканирование {len(queries)} запросов ({proxy_status})...")
             collected_in_cycle = 0
             for query in queries:
@@ -213,7 +217,7 @@ async def scanner_loop():
 async def cmd_start(message: Message):
     if message.chat.id != CHAT_ID:
         return
-    proxy_note = "✅ Подключен РФ-прокси" if PROXY_URL else "⚠️ Прокси не задан"
+    proxy_note = "✅ Подключен РФ-прокси (Chrome TLS)" if PROXY_URL else "⚠️ Прокси не задан"
     await message.answer(
         f"✅ <b>Бот мониторинга WB запущен в облаке Render</b>\n"
         f"Сеть: {proxy_note}\n"
@@ -239,7 +243,7 @@ async def cmd_stat(message: Message):
     alerts_count = cur.fetchone()[0]
     conn.close()
 
-    proxy_note = "Активен (РФ)" if PROXY_URL else "Отключен"
+    proxy_note = "Активен (РФ + Chrome TLS)" if PROXY_URL else "Отключен"
     await message.answer(
         f"📊 <b>Статистика базы:</b>\n"
         f"• Прокси: <b>{proxy_note}</b>\n"
