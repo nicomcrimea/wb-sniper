@@ -11,7 +11,6 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 # --- НАСТРОЙКИ ---
-# Токен подтягивается безопасно из настроек Environment Variables на Koyeb
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = 829573437
 
@@ -33,7 +32,7 @@ DB_PATH = "wb_prices.db"
 logging.basicConfig(level=logging.INFO)
 
 if not BOT_TOKEN:
-    raise ValueError("Ошибка: не задана переменная окружения BOT_TOKEN в настройках Koyeb!")
+    raise ValueError("Ошибка: не задана переменная окружения BOT_TOKEN в настройках Render!")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -94,38 +93,67 @@ def save_and_check_price(nm_id: int, current_price: float) -> tuple[bool, float,
     conn.close()
     return False, median_price, ratio
 
-# --- ПАРСИНГ WILDBERRIES ---
+# --- ПАРСИНГ WILDBERRIES (ОБНОВЛЕННЫЙ v13/v9) ---
 async def fetch_wb_search(session: aiohttp.ClientSession, query: str, page: int = 1) -> list[dict]:
-    url = "https://search.wb.ru/exactmatch/ru/common/v7/search"
+    endpoints = [
+        "https://search.wb.ru/exactmatch/ru/common/v13/search",
+        "https://search.wb.ru/exactmatch/ru/common/v9/search",
+        "https://u-search.wb.ru/exactmatch/ru/common/v13/search"
+    ]
     params = {
         "ab_testing": "false",
         "appType": "1",
         "curr": "rub",
         "dest": "-1257786",
+        "hide_dtype": "10",
+        "lang": "ru",
         "page": str(page),
         "query": query,
         "resultset": "catalog",
         "sort": "popular",
-        "spp": "30"
+        "spp": "30",
+        "suppressSpellcheck": "false"
     }
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        "Accept": "*/*"
+        "Accept": "*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Connection": "keep-alive",
+        "Origin": "https://www.wildberries.ru",
+        "Referer": f"https://www.wildberries.ru/catalog/0/search.aspx?search={query}",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"'
     }
-    try:
-        async with session.get(url, params=params, headers=headers, timeout=15) as resp:
-            if resp.status == 200:
-                data = await resp.json(content_type=None)
-                return data.get("data", {}).get("products", [])
-    except Exception as e:
-        logging.error(f"Ошибка запроса '{query}': {e}")
+
+    for url in endpoints:
+        try:
+            async with session.get(url, params=params, headers=headers, timeout=15) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    products = data.get("data", {}).get("products", [])
+                    if products:
+                        return products
+                else:
+                    logging.warning(f"Эндпоинт {url} вернул статус {resp.status}")
+        except Exception as e:
+            logging.warning(f"Сбой на {url} для '{query}': {e}")
+            continue
+
+    logging.error(f"Не удалось получить данные WB по запросу '{query}' (стр. {page})")
     return []
 
 async def scanner_loop():
-    async with aiohttp.ClientSession() as session:
+    # Отключаем строгий парсер заголовков для совместимости с балансировщиком WB
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
         while True:
             queries = get_queries()
             logging.info(f"Сканирование {len(queries)} запросов...")
+            collected_in_cycle = 0
             for query in queries:
                 for page in range(1, 4):
                     products = await fetch_wb_search(session, query, page)
@@ -153,6 +181,7 @@ async def scanner_loop():
                         if rating < MIN_RATING or feedbacks < MIN_FEEDBACKS:
                             continue
 
+                        collected_in_cycle += 1
                         is_deal, median_price, ratio = save_and_check_price(nm_id, current_price)
                         if is_deal:
                             link = f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx"
@@ -169,6 +198,7 @@ async def scanner_loop():
                             except Exception as e:
                                 logging.error(f"Ошибка отправки в Telegram: {e}")
                     await asyncio.sleep(2)
+            logging.info(f"Цикл завершен. Обработано подходящих товаров: {collected_in_cycle}")
             await asyncio.sleep(CHECK_INTERVAL_SEC)
 
 # --- КОМАНДЫ БОТА ---
@@ -177,7 +207,7 @@ async def cmd_start(message: Message):
     if message.chat.id != CHAT_ID:
         return
     await message.answer(
-        f"✅ <b>Бот мониторинга WB запущен в облаке Koyeb</b>\n"
+        f"✅ <b>Бот мониторинга WB запущен в облаке Render</b>\n"
         f"Порог выгоды: дешевле медианы в <b>{DISCOUNT_MULTIPLIER}</b> раз.\n\n"
         f"Команды:\n"
         f"/stat — статистика базы цен\n"
@@ -232,7 +262,7 @@ async def cmd_add(message: Message):
     conn.close()
     await message.answer(f"✅ Запрос <b>«{new_q}»</b> добавлен в мониторинг.", parse_mode="HTML")
 
-# --- ВЕБ-ЗАГЛУШКА ДЛЯ ПРОВЕРКИ ЗДОРОВЬЯ KOYEB ---
+# --- ВЕБ-ЗАГЛУШКА ДЛЯ ПРОВЕРКИ ЗДОРОВЬЯ RENDER ---
 async def health_check(request):
     return web.Response(text="WB Sniper Bot is running!")
 
