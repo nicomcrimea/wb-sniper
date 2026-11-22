@@ -12,6 +12,7 @@ from aiogram.types import Message
 
 # --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+PROXY_URL = os.getenv("PROXY_URL")  # Формат: http://login:pass@ip:port
 CHAT_ID = 829573437
 
 DEFAULT_QUERIES = [
@@ -93,7 +94,7 @@ def save_and_check_price(nm_id: int, current_price: float) -> tuple[bool, float,
     conn.close()
     return False, median_price, ratio
 
-# --- ПАРСИНГ WILDBERRIES (ОБНОВЛЕННЫЙ v13/v9) ---
+# --- ПАРСИНГ WILDBERRIES ЧЕРЕЗ РФ-ПРОКСИ ---
 async def fetch_wb_search(session: aiohttp.ClientSession, query: str, page: int = 1) -> list[dict]:
     endpoints = [
         "https://search.wb.ru/exactmatch/ru/common/v13/search",
@@ -131,7 +132,13 @@ async def fetch_wb_search(session: aiohttp.ClientSession, query: str, page: int 
 
     for url in endpoints:
         try:
-            async with session.get(url, params=params, headers=headers, timeout=15) as resp:
+            async with session.get(
+                url,
+                params=params,
+                headers=headers,
+                proxy=PROXY_URL,
+                timeout=20
+            ) as resp:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
                     products = data.get("data", {}).get("products", [])
@@ -147,12 +154,12 @@ async def fetch_wb_search(session: aiohttp.ClientSession, query: str, page: int 
     return []
 
 async def scanner_loop():
-    # Отключаем строгий парсер заголовков для совместимости с балансировщиком WB
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
         while True:
             queries = get_queries()
-            logging.info(f"Сканирование {len(queries)} запросов...")
+            proxy_status = "через РФ-прокси" if PROXY_URL else "БЕЗ ПРОКСИ (напрямую)"
+            logging.info(f"Сканирование {len(queries)} запросов ({proxy_status})...")
             collected_in_cycle = 0
             for query in queries:
                 for page in range(1, 4):
@@ -206,8 +213,10 @@ async def scanner_loop():
 async def cmd_start(message: Message):
     if message.chat.id != CHAT_ID:
         return
+    proxy_note = "✅ Подключен РФ-прокси" if PROXY_URL else "⚠️ Прокси не задан"
     await message.answer(
         f"✅ <b>Бот мониторинга WB запущен в облаке Render</b>\n"
+        f"Сеть: {proxy_note}\n"
         f"Порог выгоды: дешевле медианы в <b>{DISCOUNT_MULTIPLIER}</b> раз.\n\n"
         f"Команды:\n"
         f"/stat — статистика базы цен\n"
@@ -230,8 +239,10 @@ async def cmd_stat(message: Message):
     alerts_count = cur.fetchone()[0]
     conn.close()
 
+    proxy_note = "Активен (РФ)" if PROXY_URL else "Отключен"
     await message.answer(
         f"📊 <b>Статистика базы:</b>\n"
+        f"• Прокси: <b>{proxy_note}</b>\n"
         f"• Всего товаров отслеживается: <b>{total_items}</b>\n"
         f"• Готовы к поиску скидок (накопили медиану): <b>{ready_items}</b>\n"
         f"• Найдено сливов (×{DISCOUNT_MULTIPLIER}+): <b>{alerts_count}</b>",
